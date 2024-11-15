@@ -770,13 +770,15 @@ pdf_path = "Coursera Introduction of ML.pdf"
 
 "!---------------------------------------------------------------------------"
 
-
 from flask import Flask, request, send_file
 import fitz  # PyMuPDF
+import pdfplumber
 import pandas as pd
 import re
 import os
-import torch
+import pytesseract
+from PIL import Image
+import camelot
 
 # Configure Flask
 app = Flask(__name__)
@@ -789,42 +791,101 @@ HEADERS = [
     "N", "Nb", "V", "Ti", "Ca", "Cr", "Cu", "Mo", "Sn", "Ni"
 ]
 
-# Load YOLO model
-MODEL_PATH = 'C:/path/to/your/yolo_model.pt'  # Update with the path to your YOLO model
-model = torch.hub.load('ultralytics/yolov5', 'custom', path=MODEL_PATH, force_reload=True)
+# Function to clean and convert extracted values
+def clean_value(value):
+    # Remove non-numeric characters except decimals, scientific notation
+    cleaned = re.sub(r"[^\d\.\-eE]", "", value)
+    try:
+        # Attempt to convert to float or int if applicable
+        return float(cleaned) if '.' in cleaned or 'e' in cleaned.lower() else int(cleaned)
+    except ValueError:
+        return value  # Return as-is if conversion fails
 
-# Function to extract data from PDF
-def extract_data_from_pdf(file_path):
+# Function to extract text using regex
+def extract_with_regex(text):
+    extracted_data = {header: "" for header in HEADERS}
+    for header in HEADERS:
+        # Pattern to capture numeric values
+        pattern = rf"{header}\s*[:\-]?\s*([\d\.\,\/\-\+eE\s]+)"
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            extracted_data[header] = clean_value(match.group(1).strip())
+    return extracted_data
+
+# Function to extract using pdfplumber
+def extract_with_pdfplumber(file_path):
+    extracted_data = {header: "" for header in HEADERS}
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                page_data = extract_with_regex(text)
+                for key, value in page_data.items():
+                    if value and not extracted_data[key]:  # Fill only empty fields
+                        extracted_data[key] = value
+    return extracted_data
+
+# Function to perform OCR on images in PDF
+def extract_with_ocr(file_path):
     pdf_document = fitz.open(file_path)
     extracted_data = {header: "" for header in HEADERS}
 
     for page_num in range(pdf_document.page_count):
         page = pdf_document[page_num]
-        text = page.get_text()
+        image = page.get_pixmap()
+        image_path = f"page_{page_num}.png"
+        image.save(image_path)
 
-        # YOLO object detection on the page if necessary
-        page_image = page.get_pixmap()  # Get page image for object detection
-        page_image_path = f'page_{page_num}.png'
-        page_image.save(page_image_path)
+        # OCR the page image
+        ocr_text = pytesseract.image_to_string(Image.open(image_path))
+        page_data = extract_with_regex(ocr_text)
+        for key, value in page_data.items():
+            if value and not extracted_data[key]:  # Fill only empty fields
+                extracted_data[key] = value
 
-        # Run YOLO model on the page image
-        results = model(page_image_path)
-
-        # Process detected objects if relevant (e.g., bounding boxes for certain text regions)
-        for det in results.xyxy[0]:  # Assuming results.xyxy[0] contains bounding box info
-            x1, y1, x2, y2, conf, cls = det  # Coordinates and confidence for each detection
-            # You can implement further processing here, depending on requirements
-
-        os.remove(page_image_path)  # Clean up the page image file
-
-        # Extract each header's value based on keywords
-        for header in HEADERS:
-            pattern = rf"{header}\s*[:\-]?\s*([^\n]*)"
-            match = re.search(pattern, text)
-            if match:
-                extracted_data[header] = match.group(1).strip()
-
+        os.remove(image_path)  # Clean up image file
     pdf_document.close()
+    return extracted_data
+
+# Function to extract tables using Camelot
+def extract_with_camelot(file_path):
+    extracted_data = {header: "" for header in HEADERS}
+    tables = camelot.read_pdf(file_path, pages='all')
+    for table in tables:
+        df = table.df
+        for header in HEADERS:
+            if header in df.values:
+                header_row = df[df == header].stack().index[0][0]
+                value = df.iloc[header_row, df.columns.get_loc(header) + 1] if header_row < len(df) - 1 else ""
+                extracted_data[header] = clean_value(value.strip())
+    return extracted_data
+
+# Combined function to extract data
+def extract_data_from_pdf(file_path):
+    extracted_data = {header: "" for header in HEADERS}
+
+    # 1. Try extracting with pdfplumber and regex
+    print("Attempting pdfplumber extraction...")
+    extracted_data.update(extract_with_pdfplumber(file_path))
+
+    # 2. If fields are still missing, try OCR
+    missing_fields = [key for key, value in extracted_data.items() if not value]
+    if missing_fields:
+        print("Attempting OCR extraction...")
+        ocr_data = extract_with_ocr(file_path)
+        for field in missing_fields:
+            if ocr_data.get(field):
+                extracted_data[field] = ocr_data[field]
+
+    # 3. Attempt Camelot for table extraction if fields are still missing
+    missing_fields = [key for key, value in extracted_data.items() if not value]
+    if missing_fields:
+        print("Attempting Camelot table extraction...")
+        table_data = extract_with_camelot(file_path)
+        for field in missing_fields:
+            if table_data.get(field):
+                extracted_data[field] = table_data[field]
+
     return extracted_data
 
 # Route to handle file upload and processing
@@ -839,6 +900,7 @@ def upload_file():
         if file.filename == '':
             return "No selected file."
 
+        # Save the uploaded file
         file_path = os.path.join("uploads", file.filename)
         file.save(file_path)
         
@@ -850,6 +912,7 @@ def upload_file():
         output_path = os.path.join("outputs", "extracted_data.csv")
         df.to_csv(output_path, index=False)
 
+        # Clean up the uploaded file
         os.remove(file_path)
 
         return send_file(output_path, as_attachment=True)
